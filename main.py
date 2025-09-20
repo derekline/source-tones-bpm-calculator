@@ -19,9 +19,9 @@ try:
 except Exception:
     sa = None
 
-APP_TITLE = "BPM Calculator (Safe Metronome)"
-APP_MIN_WIDTH = 780
-APP_MIN_HEIGHT = 680
+APP_TITLE = "BPM Calculator (Safe Metronome + Visual)"
+APP_MIN_WIDTH = 820
+APP_MIN_HEIGHT = 760
 SR = 44100  # sample rate
 BYTES_PER_SAMPLE = 2
 NUM_CH = 1
@@ -82,12 +82,10 @@ class AudioEngine:
                 self._sa_accent = sa.WaveObject(ACCENT_PCM, num_channels=NUM_CH, bytes_per_sample=BYTES_PER_SAMPLE, sample_rate=SR)
                 self._sa_tick   = sa.WaveObject(TICK_PCM,   num_channels=NUM_CH, bytes_per_sample=BYTES_PER_SAMPLE, sample_rate=SR)
             except Exception as e:
-                # Fallback to System if SA init fails
                 print("[AudioEngine] Failed to init simpleaudio, falling back to System:", e)
                 self.mode = 'System'
 
         if self.mode == 'System':
-            # Write two temp files once and reuse
             try:
                 ta = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                 ta.write(ACCENT_WAV); ta.flush(); ta.close()
@@ -99,7 +97,6 @@ class AudioEngine:
                 print("[AudioEngine] Failed to create temp wavs:", e)
 
     def cleanup(self):
-        # Remove temp files if any
         for p in (self._tmp_accent, self._tmp_tick):
             if p and os.path.exists(p):
                 try:
@@ -115,9 +112,8 @@ class AudioEngine:
             except Exception as e:
                 print("[AudioEngine] SimpleAudio play failed; switching to System:", e)
                 self.mode = 'System'
-                # fallthrough to system
 
-        # System mode playback
+        # System mode
         if self.system == 'Darwin':
             path = self._tmp_accent if accent else self._tmp_tick
             if path:
@@ -133,7 +129,6 @@ class AudioEngine:
             except Exception as e:
                 print("[AudioEngine] winsound failed:", e)
         else:
-            # Linux/BSD: try paplay/aplay
             path = self._tmp_accent if accent else self._tmp_tick
             if path:
                 for cmd in (['paplay', path], ['aplay', path]):
@@ -162,6 +157,8 @@ class BpmCalculator(tk.Tk):
         self.metro_accent_every_var = tk.IntVar(value=4)
         self.audio_mode_var = tk.StringVar(value="System")
         self.audio_engine = AudioEngine(mode=self.audio_mode_var.get())
+        self.audio_enabled_var = tk.BooleanVar(value=True)
+        self.visual_enabled_var = tk.BooleanVar(value=True)
 
         # Vars
         self.bpm_var = tk.DoubleVar(value=120.0)
@@ -262,6 +259,20 @@ class BpmCalculator(tk.Tk):
                                              values=["System"] + (["SimpleAudio"] if sa is not None else []))
         self.audio_mode_combo.grid(row=0, column=6, padx=8, sticky="w")
 
+        ttk.Checkbutton(metro, text="Audio On", variable=self.audio_enabled_var).grid(row=1, column=0, padx=12, sticky="w")
+        ttk.Checkbutton(metro, text="Visual On", variable=self.visual_enabled_var).grid(row=1, column=1, sticky="w")
+
+        # === Visual Beat Indicator ===
+        visual = ttk.LabelFrame(main, text="Visual Beat")
+        visual.pack(fill="x", pady=(0, 12))
+        self.canvas = tk.Canvas(visual, width=140, height=140, highlightthickness=0)
+        self.canvas.grid(row=0, column=0, padx=12, pady=8, sticky="w")
+        self._circle = self.canvas.create_oval(10, 10, 130, 130, fill="#1f2937", outline="")
+        # Label for beat count / subdivision
+        self.beat_label_var = tk.StringVar(value="Ready")
+        ttk.Label(visual, textvariable=self.beat_label_var, font=("", 12, "bold")).grid(row=0, column=1, padx=12, sticky="w")
+        ttk.Label(visual, text="Accent flashes brighter; normal beats flash dimmer.").grid(row=0, column=2, padx=12, sticky="w")
+
         # === Summary row ===
         summary = ttk.LabelFrame(main, text="Summary")
         summary.pack(fill="x", pady=(0, 12))
@@ -296,7 +307,7 @@ class BpmCalculator(tk.Tk):
         self.tree.column("millis", width=160, anchor="e")
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
 
-        hint = ttk.Label(main, text="Safe Mode: 'System' engine uses OS audio (afplay/winsound/aplay). Switch to 'SimpleAudio' only if you want low-latency and it works on your machine.", foreground="#666")
+        hint = ttk.Label(main, text="Safe Mode audio by default. Switch to 'SimpleAudio' if desired. Visual indicator flashes on each tick.", foreground="#666")
         hint.pack(anchor="w", padx=4, pady=(0, 4))
 
         # Attach callback for BPM slider after widgets exist
@@ -310,7 +321,6 @@ class BpmCalculator(tk.Tk):
         self.audio_mode_var.trace_add("write", lambda *args: self._on_audio_mode_change())
 
     def _on_audio_mode_change(self):
-        # Rebuild engine cleanly (stop metronome first)
         self.stop_metronome()
         if self.audio_engine:
             self.audio_engine.cleanup()
@@ -412,6 +422,15 @@ class BpmCalculator(tk.Tk):
             return 1.5
         return 1.0
 
+    def _flash_visual(self, accent=False, count=0):
+        # Accent bright (e.g., orange/red); normal dim (e.g., teal/blue)
+        fill = "#ef4444" if accent else "#06b6d4"
+        base = "#1f2937"
+        self.canvas.itemconfig(self._circle, fill=fill)
+        self.beat_label_var.set(f"Beat {count + 1}" if accent else f"tick {count + 1}")
+        # revert after 120ms
+        self.after(120, lambda: self.canvas.itemconfig(self._circle, fill=base))
+
     def _metronome_loop(self):
         count = 0
         next_time = time.perf_counter()
@@ -428,11 +447,18 @@ class BpmCalculator(tk.Tk):
 
             accent_every = max(1, int(self.metro_accent_every_var.get()))
             is_accent = (count % accent_every == 0)
-            try:
-                self.audio_engine.play(accent=is_accent)
-            except Exception as e:
-                # Keep UI alive even if audio fails
-                print("[Metronome] Audio play error:", e)
+
+            # Schedule UI flash safely from thread
+            if self.visual_enabled_var.get():
+                self.after(0, self._flash_visual, is_accent, count % accent_every)
+
+            # Play audio
+            if self.audio_enabled_var.get():
+                try:
+                    self.audio_engine.play(accent=is_accent)
+                except Exception as e:
+                    print("[Metronome] Audio play error:", e)
+
             count = (count + 1) % 1000000
 
             next_time += period
@@ -523,7 +549,6 @@ class BpmCalculator(tk.Tk):
                 self.tree.insert("", "end", values=(name, f"{beats:g}", ms))
 
     def destroy(self):
-        # Ensure background thread stops and temp files get cleaned up
         self.stop_metronome()
         if self.audio_engine:
             self.audio_engine.cleanup()
